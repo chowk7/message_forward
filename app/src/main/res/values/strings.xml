@@ -28,4 +28,10 @@
     <string name="permissions_required">SMS 수신/발신 권한이 필요합니다</string>
     <string name="rules_count">필터 규칙 %d개</string>
     <string name="numbers_count">포워딩 번호 %d개</string>
+    <string name="battery_warning">배터리 최적화가 켜져 있어 백그라운드에서 포워딩이 중단될 수 있습니다.</string>
+    <string name="battery_fix">해제하기</string>
+    <string name="battery_dialog_title">배터리 최적화 해제</string>
+    <string name="battery_dialog_message">SMS 포워딩이 백그라운드에서 안정적으로 동작하려면 배터리 최적화를 해제해야 합니다.\n\n설정 화면에서 이 앱의 배터리 최적화를 \"제한 없음\"으로 변경해주세요.</string>
+    <string name="battery_dialog_auto">자동으로 해제</string>
+    <string name="battery_dialog_manual">설정으로 이동</string>
 </resources>

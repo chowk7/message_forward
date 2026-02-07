@@ -1,13 +1,19 @@
 package com.smsforwarder.ui.home
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
@@ -56,7 +62,13 @@ class MainActivity : AppCompatActivity() {
 
         setupToggle()
         setupCards()
+        setupBatteryWarning()
         observeData()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateBatteryWarning()
     }
 
     private fun setupToggle() {
@@ -70,6 +82,10 @@ class MainActivity : AppCompatActivity() {
             }
             prefs.edit().putBoolean("forwarding_enabled", checked).apply()
             updateStatusText(checked)
+
+            if (checked) {
+                checkBatteryOptimization()
+            }
         }
     }
 
@@ -89,6 +105,70 @@ class MainActivity : AppCompatActivity() {
         }
         binding.cardForwardLogs.setOnClickListener {
             startActivity(Intent(this, ForwardLogActivity::class.java))
+        }
+    }
+
+    private fun setupBatteryWarning() {
+        binding.cardBatteryWarning.setOnClickListener {
+            showBatteryDialog()
+        }
+        binding.btnFixBattery.setOnClickListener {
+            showBatteryDialog()
+        }
+        updateBatteryWarning()
+    }
+
+    private fun updateBatteryWarning() {
+        val isOptimized = isBatteryOptimized()
+        binding.cardBatteryWarning.visibility = if (isOptimized) View.VISIBLE else View.GONE
+    }
+
+    private fun isBatteryOptimized(): Boolean {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return !powerManager.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun checkBatteryOptimization() {
+        if (isBatteryOptimized()) {
+            showBatteryDialog()
+        }
+    }
+
+    private fun showBatteryDialog() {
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.battery_dialog_title))
+            .setMessage(getString(R.string.battery_dialog_message))
+            .setPositiveButton(getString(R.string.battery_dialog_auto)) { _, _ ->
+                requestIgnoreBatteryOptimization()
+            }
+            .setNeutralButton(getString(R.string.battery_dialog_manual)) { _, _ ->
+                openBatterySettings()
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    @Suppress("BatteryLife")
+    private fun requestIgnoreBatteryOptimization() {
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:$packageName")
+        }
+        startActivity(intent)
+    }
+
+    private fun openBatterySettings() {
+        try {
+            // Try manufacturer-specific battery settings first
+            val intent = Intent().apply {
+                action = Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            // Fallback to general app settings
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            startActivity(intent)
         }
     }
 
