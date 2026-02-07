@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SMS 포워더</string>
+    <string name="forwarding_status">포워딩 상태</string>
+    <string name="forwarding_enabled">포워딩 활성화</string>
+    <string name="filter_rules">필터 규칙</string>
+    <string name="forward_numbers">포워딩 번호</string>
+    <string name="forward_logs">포워딩 로그</string>
+    <string name="add_filter">필터 추가</string>
+    <string name="add_number">번호 추가</string>
+    <string name="text_keyword">텍스트 키워드</string>
+    <string name="sender_number">발신 번호</string>
+    <string name="save">저장</string>
+    <string name="cancel">취소</string>
+    <string name="delete">삭제</string>
+    <string name="filter_type">필터 유형</string>
+    <string name="filter_value">필터 값</string>
+    <string name="phone_number">전화번호</string>
+    <string name="label">라벨 (선택)</string>
+    <string name="no_rules">등록된 필터 규칙이 없습니다</string>
+    <string name="no_numbers">등록된 포워딩 번호가 없습니다</string>
+    <string name="no_logs">포워딩 로그가 없습니다</string>
+    <string name="clear_logs">로그 삭제</string>
+    <string name="keyword_hint">예: 수학성적</string>
+    <string name="number_hint">예: 01020719157</string>
+    <string name="forward_number_hint">포워딩할 전화번호</string>
+    <string name="label_hint">예: 엄마, 아빠</string>
+    <string name="permissions_required">SMS 수신/발신 권한이 필요합니다</string>
+    <string name="rules_count">필터 규칙 %d개</string>
+    <string name="numbers_count">포워딩 번호 %d개</string>
+</resources>
