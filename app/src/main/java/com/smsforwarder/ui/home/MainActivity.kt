@@ -22,6 +22,7 @@ import com.smsforwarder.databinding.ActivityMainBinding
 import com.smsforwarder.ui.filter.FilterEditActivity
 import com.smsforwarder.ui.forward.ForwardNumberActivity
 import com.smsforwarder.ui.log.ForwardLogActivity
+import com.smsforwarder.service.MessageObserverService
 import com.smsforwarder.viewmodel.MainViewModel
 
 class MainActivity : AppCompatActivity() {
@@ -76,6 +77,10 @@ class MainActivity : AppCompatActivity() {
         binding.switchForwarding.isChecked = isEnabled
         updateStatusText(isEnabled)
 
+        if (isEnabled) {
+            startMessageObserverService()
+        }
+
         binding.switchForwarding.setOnCheckedChangeListener { _, checked ->
             if (checked && !hasAllPermissions()) {
                 permissionLauncher.launch(requiredPermissions)
@@ -85,12 +90,25 @@ class MainActivity : AppCompatActivity() {
 
             if (checked) {
                 checkBatteryOptimization()
+                startMessageObserverService()
+            } else {
+                stopMessageObserverService()
             }
         }
     }
 
+    private fun startMessageObserverService() {
+        val intent = Intent(this, MessageObserverService::class.java)
+        ContextCompat.startForegroundService(this, intent)
+    }
+
+    private fun stopMessageObserverService() {
+        val intent = Intent(this, MessageObserverService::class.java)
+        stopService(intent)
+    }
+
     private fun updateStatusText(enabled: Boolean) {
-        binding.tvStatus.text = if (enabled) "활성화됨 - SMS 포워딩 중" else "비활성화"
+        binding.tvStatus.text = if (enabled) "활성화됨 - SMS/MMS/채팅+ 포워딩 중" else "비활성화"
         binding.tvStatus.setTextColor(
             ContextCompat.getColor(this, if (enabled) R.color.success else R.color.text_secondary)
         )
