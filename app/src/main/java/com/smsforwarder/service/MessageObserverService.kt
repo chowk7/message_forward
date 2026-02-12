@@ -2,8 +2,6 @@ package com.smsforwarder.service
 
 import android.app.NotificationManager
 import android.app.Service
-import android.content.ContentResolver
-import android.content.Context
 import android.content.Intent
 import android.database.ContentObserver
 import android.net.Uri
@@ -28,21 +26,28 @@ class MessageObserverService : Service() {
         private const val NOTIFICATION_ID = 2001
         private const val PREF_LAST_MMS_ID = "last_mms_id"
         private const val PREF_LAST_CHAT_SMS_ID = "last_chat_sms_id"
-        private val MMS_SMS_URI = Uri.parse("content://mms-sms/")
         private val MMS_URI = Uri.parse("content://mms/")
-        private val MMS_PART_URI = Uri.parse("content://mms/part")
+        private const val FORWARD_PREFIX_MMS = "[MMS 포워딩]"
+        private const val FORWARD_PREFIX_CHAT = "[채팅+ 포워딩]"
+        private const val FORWARD_PREFIX_SMS = "[포워딩]"
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var mmsObserver: ContentObserver? = null
     private var smsObserver: ContentObserver? = null
+    // Track recently processed IDs to prevent duplicate processing
+    private val recentlyProcessedChatIds = mutableSetOf<Long>()
+    private val recentlyProcessedMmsIds = mutableSetOf<Long>()
+    // Flag to suppress observer while we're sending
+    @Volatile
+    private var isSendingMessage = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         startForegroundNotification()
-        initLastIds()
+        resetLastIds()
         registerObservers()
         Log.d(TAG, "MessageObserverService started")
     }
@@ -60,23 +65,34 @@ class MessageObserverService : Service() {
     }
 
     private fun startForegroundNotification() {
+        val prefs = getSharedPreferences("sms_forwarder_prefs", MODE_PRIVATE)
+        val chatEnabled = prefs.getBoolean("chat_forwarding_enabled", false)
+
+        val desc = buildString {
+            append("MMS 메시지 감시 중")
+            if (chatEnabled) append(" / 채팅+ 감시 중")
+        }
+
         val notification = NotificationCompat.Builder(this, SmsForwarderApp.CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_forward)
             .setContentTitle("메시지 포워딩 활성화")
-            .setContentText("MMS/채팅+ 메시지를 감시 중입니다")
+            .setContentText(desc)
             .setOngoing(true)
             .build()
         startForeground(NOTIFICATION_ID, notification)
     }
 
-    private fun initLastIds() {
+    /**
+     * Always reset to current latest IDs when service starts.
+     * This prevents forwarding old messages that arrived before the service started.
+     */
+    private fun resetLastIds() {
         val prefs = getSharedPreferences("sms_forwarder_prefs", MODE_PRIVATE)
-        if (prefs.getLong(PREF_LAST_MMS_ID, -1L) == -1L) {
-            prefs.edit().putLong(PREF_LAST_MMS_ID, getLatestMmsId()).apply()
-        }
-        if (prefs.getLong(PREF_LAST_CHAT_SMS_ID, -1L) == -1L) {
-            prefs.edit().putLong(PREF_LAST_CHAT_SMS_ID, getLatestSmsId()).apply()
-        }
+        prefs.edit()
+            .putLong(PREF_LAST_MMS_ID, getLatestMmsId())
+            .putLong(PREF_LAST_CHAT_SMS_ID, getLatestSmsId())
+            .apply()
+        Log.d(TAG, "Reset last IDs: MMS=${prefs.getLong(PREF_LAST_MMS_ID, 0)}, Chat=${prefs.getLong(PREF_LAST_CHAT_SMS_ID, 0)}")
     }
 
     private fun registerObservers() {
@@ -87,8 +103,8 @@ class MessageObserverService : Service() {
             private var debounceJob: Job? = null
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 super.onChange(selfChange, uri)
+                if (isSendingMessage) return
                 Log.d(TAG, "MMS content changed: $uri")
-                // Debounce to avoid duplicate processing
                 debounceJob?.cancel()
                 debounceJob = serviceScope.launch {
                     delay(3000) // MMS needs time to fully download
@@ -98,15 +114,19 @@ class MessageObserverService : Service() {
         }
         contentResolver.registerContentObserver(MMS_URI, true, mmsObserver!!)
 
-        // SMS observer for Chat+/RCS messages (these appear in SMS content provider but don't trigger SMS_RECEIVED)
+        // SMS observer for Chat+/RCS messages
         smsObserver = object : ContentObserver(handler) {
             private var debounceJob: Job? = null
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 super.onChange(selfChange, uri)
+                if (isSendingMessage) return
+                // Check if Chat+ forwarding is enabled
+                val prefs = getSharedPreferences("sms_forwarder_prefs", MODE_PRIVATE)
+                if (!prefs.getBoolean("chat_forwarding_enabled", false)) return
                 Log.d(TAG, "SMS content changed: $uri")
                 debounceJob?.cancel()
                 debounceJob = serviceScope.launch {
-                    delay(1000)
+                    delay(1500)
                     processNewChatMessages()
                 }
             }
@@ -163,15 +183,25 @@ class MessageObserverService : Service() {
 
             contentResolver.query(
                 MMS_URI,
-                arrayOf("_id", "date"),
+                arrayOf("_id", "date", "msg_box"),
                 "_id > ?",
                 arrayOf(lastId.toString()),
                 "_id ASC"
             )?.use { cursor ->
                 var maxId = lastId
+                val idIdx = cursor.getColumnIndex("_id")
+                val msgBoxIdx = cursor.getColumnIndex("msg_box")
+
                 while (cursor.moveToNext()) {
-                    val mmsId = cursor.getLong(0)
+                    val mmsId = cursor.getLong(idIdx)
                     if (mmsId > maxId) maxId = mmsId
+
+                    // msg_box: 1=inbox, 2=sent, 3=draft, 4=outbox
+                    val msgBox = if (msgBoxIdx >= 0) cursor.getInt(msgBoxIdx) else 1
+                    if (msgBox != 1) continue // Only process inbox (received) MMS
+
+                    if (recentlyProcessedMmsIds.contains(mmsId)) continue
+                    recentlyProcessedMmsIds.add(mmsId)
 
                     val sender = getMmsSender(mmsId)
                     val body = getMmsTextContent(mmsId)
@@ -179,14 +209,16 @@ class MessageObserverService : Service() {
                     Log.d(TAG, "New MMS: id=$mmsId, sender=$sender, body=$body")
 
                     if (sender.isNullOrEmpty() || body.isNullOrEmpty()) continue
+                    // Skip if this is a forwarded message (prevent loops)
+                    if (body.startsWith(FORWARD_PREFIX_MMS) || body.startsWith(FORWARD_PREFIX_CHAT) || body.startsWith(FORWARD_PREFIX_SMS)) continue
 
                     val matchedRule = findMatchingRule(rules, sender, body) ?: continue
                     Log.d(TAG, "MMS matched rule: ${describeRule(matchedRule)}")
 
-                    val forwardBody = "[MMS 포워딩] $body"
+                    val forwardBody = "$FORWARD_PREFIX_MMS $body"
                     for (number in forwardNumbers) {
                         try {
-                            sendSms(number.phoneNumber, forwardBody)
+                            sendSmsWithFlag(number.phoneNumber, forwardBody)
                             repository.insertLog(
                                 ForwardLog(
                                     originalSender = sender,
@@ -217,11 +249,19 @@ class MessageObserverService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "Error processing MMS messages", e)
         }
+
+        // Trim processed IDs set to prevent memory leak
+        if (recentlyProcessedMmsIds.size > 200) {
+            val sorted = recentlyProcessedMmsIds.sorted()
+            recentlyProcessedMmsIds.clear()
+            recentlyProcessedMmsIds.addAll(sorted.takeLast(50))
+        }
     }
 
     private suspend fun processNewChatMessages() {
         val prefs = getSharedPreferences("sms_forwarder_prefs", MODE_PRIVATE)
         if (!prefs.getBoolean("forwarding_enabled", false)) return
+        if (!prefs.getBoolean("chat_forwarding_enabled", false)) return
 
         val lastId = prefs.getLong(PREF_LAST_CHAT_SMS_ID, 0L)
 
@@ -234,10 +274,9 @@ class MessageObserverService : Service() {
             if (rules.isEmpty() || forwardNumbers.isEmpty()) return
 
             // Query for new incoming messages (type=1 is inbox)
-            // Chat+/RCS messages are stored with protocol=null or specific sub_id
             contentResolver.query(
                 Telephony.Sms.CONTENT_URI,
-                arrayOf("_id", "address", "body", "type", "protocol"),
+                arrayOf("_id", "address", "body", "type", "protocol", "date"),
                 "_id > ? AND type = ?",
                 arrayOf(lastId.toString(), "1"), // type 1 = inbox (received)
                 "_id ASC"
@@ -247,28 +286,43 @@ class MessageObserverService : Service() {
                 val addrIdx = cursor.getColumnIndex("address")
                 val bodyIdx = cursor.getColumnIndex("body")
                 val protocolIdx = cursor.getColumnIndex("protocol")
+                val dateIdx = cursor.getColumnIndex("date")
 
                 while (cursor.moveToNext()) {
                     val msgId = cursor.getLong(idIdx)
                     if (msgId > maxId) maxId = msgId
 
+                    // Skip already processed
+                    if (recentlyProcessedChatIds.contains(msgId)) continue
+                    recentlyProcessedChatIds.add(msgId)
+
                     val protocol = cursor.getString(protocolIdx)
-                    // SMS_RECEIVED broadcast handles protocol != null (standard SMS)
+                    // Standard SMS has protocol != null (handled by SmsReceiver)
                     // Chat+/RCS messages have protocol = null when inserted by messaging app
                     if (protocol != null) continue
 
+                    // Skip messages older than 30 seconds (safety net for stale messages)
+                    val msgDate = cursor.getLong(dateIdx)
+                    if (System.currentTimeMillis() - msgDate > 30_000) {
+                        Log.d(TAG, "Skipping old Chat+ message id=$msgId (age=${System.currentTimeMillis() - msgDate}ms)")
+                        continue
+                    }
+
                     val sender = cursor.getString(addrIdx) ?: continue
                     val body = cursor.getString(bodyIdx) ?: continue
+
+                    // Skip forwarded messages (prevent infinite loop)
+                    if (body.startsWith(FORWARD_PREFIX_CHAT) || body.startsWith(FORWARD_PREFIX_MMS) || body.startsWith(FORWARD_PREFIX_SMS)) continue
 
                     Log.d(TAG, "New Chat+ message: id=$msgId, sender=$sender, body=$body")
 
                     val matchedRule = findMatchingRule(rules, sender, body) ?: continue
                     Log.d(TAG, "Chat+ matched rule: ${describeRule(matchedRule)}")
 
-                    val forwardBody = "[채팅+ 포워딩] $body"
+                    val forwardBody = "$FORWARD_PREFIX_CHAT $body"
                     for (number in forwardNumbers) {
                         try {
-                            sendSms(number.phoneNumber, forwardBody)
+                            sendSmsWithFlag(number.phoneNumber, forwardBody)
                             repository.insertLog(
                                 ForwardLog(
                                     originalSender = sender,
@@ -298,6 +352,13 @@ class MessageObserverService : Service() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error processing Chat+ messages", e)
+        }
+
+        // Trim processed IDs set to prevent memory leak
+        if (recentlyProcessedChatIds.size > 200) {
+            val sorted = recentlyProcessedChatIds.sorted()
+            recentlyProcessedChatIds.clear()
+            recentlyProcessedChatIds.addAll(sorted.takeLast(50))
         }
     }
 
@@ -364,13 +425,25 @@ class MessageObserverService : Service() {
         }
     }
 
-    private fun sendSms(destination: String, message: String) {
-        val smsManager = getSystemService(SmsManager::class.java)
-        val parts = smsManager.divideMessage(message)
-        if (parts.size == 1) {
-            smsManager.sendTextMessage(destination, null, message, null, null)
-        } else {
-            smsManager.sendMultipartTextMessage(destination, null, parts, null, null)
+    /**
+     * Send SMS with isSendingMessage flag to suppress ContentObserver
+     * during the send, preventing feedback loops.
+     */
+    private fun sendSmsWithFlag(destination: String, message: String) {
+        isSendingMessage = true
+        try {
+            val smsManager = getSystemService(SmsManager::class.java)
+            val parts = smsManager.divideMessage(message)
+            if (parts.size == 1) {
+                smsManager.sendTextMessage(destination, null, message, null, null)
+            } else {
+                smsManager.sendMultipartTextMessage(destination, null, parts, null, null)
+            }
+        } finally {
+            // Delay clearing the flag so the observer triggered by send is also suppressed
+            Handler(Looper.getMainLooper()).postDelayed({
+                isSendingMessage = false
+            }, 2000)
         }
     }
 

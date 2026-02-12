@@ -62,6 +62,7 @@ class MainActivity : AppCompatActivity() {
         viewModel = ViewModelProvider(this)[MainViewModel::class.java]
 
         setupToggle()
+        setupChatToggle()
         setupCards()
         setupBatteryWarning()
         observeData()
@@ -95,6 +96,33 @@ class MainActivity : AppCompatActivity() {
                 stopMessageObserverService()
             }
         }
+    }
+
+    private fun setupChatToggle() {
+        val chatEnabled = prefs.getBoolean("chat_forwarding_enabled", false)
+        binding.switchChatForwarding.isChecked = chatEnabled
+        updateChatStatusText(chatEnabled)
+
+        binding.switchChatForwarding.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean("chat_forwarding_enabled", checked).apply()
+            updateChatStatusText(checked)
+
+            // Restart service to apply the change
+            if (prefs.getBoolean("forwarding_enabled", false)) {
+                stopMessageObserverService()
+                startMessageObserverService()
+            }
+        }
+    }
+
+    private fun updateChatStatusText(enabled: Boolean) {
+        binding.tvChatStatus.text = if (enabled)
+            "활성화됨 - 채팅+ 메시지도 포워딩"
+        else
+            "비활성화 - 채팅+ 메시지는 포워딩하지 않음"
+        binding.tvChatStatus.setTextColor(
+            ContextCompat.getColor(this, if (enabled) R.color.success else R.color.text_secondary)
+        )
     }
 
     private fun startMessageObserverService() {
