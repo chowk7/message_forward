@@ -18,6 +18,8 @@ import com.smsforwarder.data.model.FilterRule
 import com.smsforwarder.data.model.FilterType
 import com.smsforwarder.data.model.ForwardLog
 import kotlinx.coroutines.*
+import java.io.BufferedReader
+import java.io.InputStreamReader
 
 class MessageObserverService : Service() {
 
@@ -98,7 +100,8 @@ class MessageObserverService : Service() {
     private fun registerObservers() {
         val handler = Handler(Looper.getMainLooper())
 
-        // MMS observer
+        // MMS observer - MMS goes through stages: notification → download → complete
+        // We attempt processing at multiple delays to catch the content when ready
         mmsObserver = object : ContentObserver(handler) {
             private var debounceJob: Job? = null
             override fun onChange(selfChange: Boolean, uri: Uri?) {
@@ -107,8 +110,19 @@ class MessageObserverService : Service() {
                 Log.d(TAG, "MMS content changed: $uri")
                 debounceJob?.cancel()
                 debounceJob = serviceScope.launch {
-                    delay(3000) // MMS needs time to fully download
-                    processNewMmsMessages()
+                    // Try multiple times with increasing delay
+                    // MMS download from MMSC can take 5-15 seconds
+                    for (attempt in 1..3) {
+                        val delayMs = when (attempt) {
+                            1 -> 5000L
+                            2 -> 10000L
+                            else -> 15000L
+                        }
+                        delay(delayMs)
+                        val processed = processNewMmsMessages()
+                        if (processed) break
+                        Log.d(TAG, "MMS attempt $attempt: no messages processed, retrying...")
+                    }
                 }
             }
         }
@@ -166,12 +180,16 @@ class MessageObserverService : Service() {
         }
     }
 
-    private suspend fun processNewMmsMessages() {
+    /**
+     * @return true if at least one message was successfully processed
+     */
+    private suspend fun processNewMmsMessages(): Boolean {
         val prefs = getSharedPreferences("sms_forwarder_prefs", MODE_PRIVATE)
-        if (!prefs.getBoolean("forwarding_enabled", false)) return
+        if (!prefs.getBoolean("forwarding_enabled", false)) return false
 
         val lastId = prefs.getLong(PREF_LAST_MMS_ID, 0L)
         Log.d(TAG, "Processing new MMS messages after id=$lastId")
+        var anyProcessed = false
 
         try {
             val app = applicationContext as SmsForwarderApp
@@ -179,7 +197,7 @@ class MessageObserverService : Service() {
             val rules = repository.getEnabledRules()
             val forwardNumbers = repository.getEnabledNumbers()
 
-            if (rules.isEmpty() || forwardNumbers.isEmpty()) return
+            if (rules.isEmpty() || forwardNumbers.isEmpty()) return false
 
             contentResolver.query(
                 MMS_URI,
@@ -201,14 +219,22 @@ class MessageObserverService : Service() {
                     if (msgBox != 1) continue // Only process inbox (received) MMS
 
                     if (recentlyProcessedMmsIds.contains(mmsId)) continue
-                    recentlyProcessedMmsIds.add(mmsId)
 
                     val sender = getMmsSender(mmsId)
                     val body = getMmsTextContent(mmsId)
 
-                    Log.d(TAG, "New MMS: id=$mmsId, sender=$sender, body=$body")
+                    Log.d(TAG, "New MMS: id=$mmsId, sender=$sender, body=${body?.take(50)}")
 
-                    if (sender.isNullOrEmpty() || body.isNullOrEmpty()) continue
+                    // If sender or body is not yet available, MMS may still be downloading
+                    // Don't mark as processed so we can retry on next attempt
+                    if (sender.isNullOrEmpty() || body.isNullOrEmpty()) {
+                        Log.d(TAG, "MMS id=$mmsId not ready yet (sender=$sender, hasBody=${body != null})")
+                        continue
+                    }
+
+                    // Mark as processed only after we have content
+                    recentlyProcessedMmsIds.add(mmsId)
+
                     // Skip if this is a forwarded message (prevent loops)
                     if (body.startsWith(FORWARD_PREFIX_MMS) || body.startsWith(FORWARD_PREFIX_CHAT) || body.startsWith(FORWARD_PREFIX_SMS)) continue
 
@@ -229,6 +255,7 @@ class MessageObserverService : Service() {
                                 )
                             )
                             showNotification(sender, number.phoneNumber, "MMS")
+                            anyProcessed = true
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to forward MMS to ${number.phoneNumber}", e)
                             repository.insertLog(
@@ -256,6 +283,8 @@ class MessageObserverService : Service() {
             recentlyProcessedMmsIds.clear()
             recentlyProcessedMmsIds.addAll(sorted.takeLast(50))
         }
+
+        return anyProcessed
     }
 
     private suspend fun processNewChatMessages() {
@@ -365,6 +394,8 @@ class MessageObserverService : Service() {
     private fun getMmsSender(mmsId: Long): String? {
         return try {
             val addrUri = Uri.parse("content://mms/$mmsId/addr")
+            // Try FROM (137) first, then fallback to any address
+            var address: String? = null
             contentResolver.query(
                 addrUri,
                 arrayOf("address", "type"),
@@ -372,9 +403,33 @@ class MessageObserverService : Service() {
                 null, null
             )?.use { cursor ->
                 if (cursor.moveToFirst()) {
-                    cursor.getString(cursor.getColumnIndex("address"))
-                } else null
+                    address = cursor.getString(cursor.getColumnIndex("address"))
+                }
             }
+
+            // Fallback: try all addresses if FROM not found
+            if (address.isNullOrEmpty()) {
+                contentResolver.query(
+                    addrUri,
+                    arrayOf("address", "type"),
+                    null, null, null
+                )?.use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val type = cursor.getInt(cursor.getColumnIndex("type"))
+                        val addr = cursor.getString(cursor.getColumnIndex("address"))
+                        // Skip "insert-address-token" placeholder and our own number
+                        if (!addr.isNullOrEmpty() && addr != "insert-address-token") {
+                            // Prefer type 137 (FROM), but accept others
+                            if (type == 137 || address == null) {
+                                address = addr
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Clean up MMS address format: remove /TYPE=PLMN suffix
+            address?.replace(Regex("/TYPE=.*$"), "")?.trim()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to get MMS sender for id=$mmsId", e)
             null
@@ -386,13 +441,21 @@ class MessageObserverService : Service() {
             val partUri = Uri.parse("content://mms/$mmsId/part")
             contentResolver.query(
                 partUri,
-                arrayOf("_id", "ct", "text"),
+                arrayOf("_id", "ct", "text", "_data"),
                 "ct='text/plain'",
                 null, null
             )?.use { cursor ->
                 val sb = StringBuilder()
                 while (cursor.moveToNext()) {
-                    val text = cursor.getString(cursor.getColumnIndex("text"))
+                    // First try the text column directly
+                    var text = cursor.getString(cursor.getColumnIndex("text"))
+
+                    // If text column is null, read from _data file
+                    if (text.isNullOrEmpty()) {
+                        val partId = cursor.getLong(cursor.getColumnIndex("_id"))
+                        text = readMmsPartData(partId)
+                    }
+
                     if (!text.isNullOrEmpty()) {
                         sb.append(text)
                     }
@@ -401,6 +464,22 @@ class MessageObserverService : Service() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to get MMS text for id=$mmsId", e)
+            null
+        }
+    }
+
+    /**
+     * Read MMS part text content from _data file via content provider.
+     * Some devices store MMS text in files instead of the text column.
+     */
+    private fun readMmsPartData(partId: Long): String? {
+        return try {
+            val partUri = Uri.parse("content://mms/part/$partId")
+            contentResolver.openInputStream(partUri)?.use { inputStream ->
+                BufferedReader(InputStreamReader(inputStream, "UTF-8")).readText()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read MMS part data for partId=$partId", e)
             null
         }
     }
